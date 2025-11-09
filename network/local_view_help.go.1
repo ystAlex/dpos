@@ -1,0 +1,198 @@
+package network
+
+import (
+	"nm-dpos/config"
+	"nm-dpos/core"
+	"nm-dpos/types"
+	"nm-dpos/utils"
+)
+
+// ================================
+// 完整的共识轮次执行（集中式模式）
+// ================================
+
+// ExecuteRound 执行完整的共识轮次
+func (lnv *LocalNetworkView) ExecuteRound() *types.RoundSummary {
+	lnv.CurrentRound++
+	lnv.Network.CurrentRound = lnv.CurrentRound
+
+	startTime := utils.TimeNow()
+
+	// 1. 更新权重
+	lnv.UpdateAllWeights()
+
+	// 2. 选举代理节点
+	delegates := lnv.SelectDelegatesLocally()
+
+	// 3. 投票阶段
+	votingStats := lnv.ConductLocalVoting()
+
+	// 4. 出块阶段
+	blockStats := lnv.conductBlockProduction()
+
+	// 5. 更新表现评分
+	lnv.UpdateAllPerformanceScores()
+
+	// 6. 更新连任次数
+	lnv.updateConsecutiveTerms(delegates)
+
+	// 创建轮次摘要
+	summary := &types.RoundSummary{
+		RoundID:         lnv.CurrentRound,
+		StartTime:       startTime,
+		EndTime:         utils.TimeNow(),
+		DelegateIDs:     extractNodeIDs(delegates),
+		VotingStats:     *votingStats,
+		BlockStats:      *blockStats,
+		NetworkSnapshot: lnv.GetNetworkSnapshot(),
+	}
+
+	lnv.Network.SnapshotHistory = append(lnv.Network.SnapshotHistory, summary.NetworkSnapshot)
+
+	return summary
+}
+
+// conductBlockProduction 执行出块阶段
+func (lnv *LocalNetworkView) conductBlockProduction() *types.BlockStatistics {
+	stats := &types.BlockStatistics{}
+
+	for _, delegate := range lnv.CurrentDelegates {
+		block := lnv.ProduceBlock(delegate)
+		stats.TotalBlocks++
+
+		if block.Success {
+			if block.IsDelayed {
+				stats.DelayedBlocks++
+			} else {
+				stats.ValidBlocks++
+			}
+
+			// 选择验证者
+			validators := lnv.selectValidators(delegate, 3)
+			rewards := lnv.DistributeBlockReward(delegate, validators)
+
+			block.Reward = rewards[delegate.ID]
+			block.Validators = extractNodeIDs(validators)
+			block.RewardDistribution = rewards
+
+			stats.TotalRewardDistributed += block.Reward
+		} else {
+			stats.InvalidBlocks++
+			// 惩罚出块失败
+			core.ConfiscateDeposit(delegate, config.BlockFailurePenalty)
+		}
+
+		delegate.BlockHistory = append(delegate.BlockHistory, *block)
+	}
+
+	if stats.TotalBlocks > 0 {
+		stats.SuccessRate = float64(stats.ValidBlocks) / float64(stats.TotalBlocks)
+		stats.AverageBlockReward = stats.TotalRewardDistributed / float64(stats.TotalBlocks)
+	}
+
+	return stats
+}
+
+// selectValidators 选择验证者
+func (lnv *LocalNetworkView) selectValidators(producer *types.Node, count int) []*types.Node {
+	candidates := make([]*types.Node, 0)
+	for _, delegate := range lnv.CurrentDelegates {
+		if delegate.ID != producer.ID && delegate.IsActive {
+			candidates = append(candidates, delegate)
+		}
+	}
+
+	utils.Shuffle(candidates)
+
+	if count > len(candidates) {
+		count = len(candidates)
+	}
+
+	return candidates[:count]
+}
+
+// updateConsecutiveTerms 更新连任次数
+func (lnv *LocalNetworkView) updateConsecutiveTerms(currentDelegates []*types.Node) {
+	currentIDs := make(map[string]bool)
+	for _, delegate := range currentDelegates {
+		currentIDs[delegate.ID] = true
+	}
+
+	for _, node := range lnv.Network.Nodes {
+		if currentIDs[node.ID] {
+			node.ConsecutiveTerms++
+		} else if node.Type == types.DelegateNode {
+			node.ConsecutiveTerms = 0
+			node.Type = types.VoterNode
+		}
+	}
+}
+
+// extractNodeIDs 提取节点ID列表
+func extractNodeIDs(nodes []*types.Node) []string {
+	ids := make([]string, len(nodes))
+	for i, node := range nodes {
+		ids[i] = node.ID
+	}
+	return ids
+}
+
+// UpdateAllWeights 更新所有节点权重（用于集中式模式）
+func (lnv *LocalNetworkView) UpdateAllWeights() {
+	allNodes := lnv.GetAllKnownNodes()
+	core.UpdateAllNodesWeight(allNodes, 1.0, lnv.EnvironmentWeight)
+	lnv.recalculateNetworkStats()
+}
+
+// UpdateAllPerformanceScores 更新所有节点表现评分（集中式模式）
+func (lnv *LocalNetworkView) UpdateAllPerformanceScores() {
+	delegatePerformance := lnv.GetAverageDelegatePerformance()
+
+	for _, node := range lnv.Network.Nodes {
+		if !node.IsActive {
+			continue
+		}
+
+		core.UpdateOnlineTime(node)
+
+		if node.Type == types.VoterNode {
+			core.UpdateVoterPerformance(node, lnv.Network.NormalVotingPeriod, delegatePerformance)
+		} else {
+			core.UpdateDelegatePerformance(node)
+		}
+	}
+}
+
+// ================================
+// 出块相关（集中式模式）
+// ================================
+
+// ProduceBlock 生产区块
+func (lnv *LocalNetworkView) ProduceBlock(delegate *types.Node) *types.BlockRecord {
+	lnv.Network.CurrentBlockHeight++
+
+	// 模拟出块成功率
+	successProb := delegate.PerformanceScore
+	isSuccess := utils.RandomFloat() < successProb
+	isDelayed := utils.RandomFloat() < 0.1
+
+	block := &types.BlockRecord{
+		Timestamp:   utils.TimeNow(),
+		BlockHeight: lnv.Network.CurrentBlockHeight,
+		RoundID:     lnv.CurrentRound,
+		Success:     isSuccess,
+		IsDelayed:   isDelayed,
+		IsInvalid:   !isSuccess,
+	}
+
+	// 记录出块
+	core.RecordBlockProduction(delegate, block.BlockHeight, isSuccess, isDelayed, !isSuccess)
+
+	return block
+}
+
+// DistributeBlockReward 分配区块奖励
+func (lnv *LocalNetworkView) DistributeBlockReward(producer *types.Node, validators []*types.Node) map[string]float64 {
+	transactionFees := 50.0 + utils.RandomFloat()*100.0
+	return core.DistributeBlockRewards(producer, validators, transactionFees)
+}
