@@ -4,9 +4,10 @@ set -e
 
 # 配置
 NUM_NODES=5
-BASE_PORT=8000
+BASE_PORT=12000
 TEST_MODE=true
-TEST_DURATION=100
+TEST_ROUNDS=100
+MODE="full"
 OUTPUT_DIR="./test_results"
 
 # 颜色输出
@@ -18,6 +19,15 @@ NC='\033[0m'
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}NM-DPoS 多节点网络启动脚本${NC}"
 echo -e "${GREEN}========================================${NC}"
+
+# ============================================
+# 计算统一的创世时间（当前时间+1分钟）
+# ============================================
+GENESIS_TIME=$(date -u -d '+1 minute' '+%Y-%m-%dT%H:%M:%S+00:00' 2>/dev/null || date -u -v+1M '+%Y-%m-%dT%H:%M:%S+00:00')
+
+echo -e "${GREEN}创世时间: ${GENESIS_TIME}${NC}"
+echo -e "${YELLOW}所有节点将在此时间同步启动区块产生${NC}"
+echo ""
 
 # 清理
 echo -e "${YELLOW}清理旧进程和日志...${NC}"
@@ -62,8 +72,10 @@ SEED_ADDR="localhost:${BASE_PORT}"
     -weight=150 \
     -perf=0.95 \
     -delay=10 \
+    -time="${GENESIS_TIME}" \
     -test=${TEST_MODE} \
-    -duration=${TEST_DURATION} \
+    -rounds=${TEST_ROUNDS} \
+    -mode=${MODE} \
     -output=${OUTPUT_DIR} \
     > logs/node-0.log 2>&1 &
 
@@ -95,6 +107,7 @@ for i in $(seq 1 $((NUM_NODES-1))); do
     echo "  地址: ${ADDR}"
     echo "  种子: ${SEED_ADDR}"
     echo "  配置: 权重=${WEIGHT}, 表现=${PERF}, 延迟=${DELAY}ms"
+    echo "  创世时间: ${GENESIS_TIME}"
 
     ./bin/nm-dpos \
         -id="node-${i}" \
@@ -103,8 +116,9 @@ for i in $(seq 1 $((NUM_NODES-1))); do
         -weight=${WEIGHT} \
         -perf=${PERF} \
         -delay=${DELAY} \
+        -time="${GENESIS_TIME}" \
         -test=${TEST_MODE} \
-        -duration=${TEST_DURATION} \
+        -rounds=${TEST_ROUNDS} \
         -output=${OUTPUT_DIR} \
         > logs/node-${i}.log 2>&1 &
 
@@ -136,11 +150,33 @@ for i in $(seq 0 $((NUM_NODES-1))); do
     fi
 done
 
+# 显示创世时间倒计时
+echo ""
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}等待创世时间到达...${NC}"
+echo -e "${GREEN}========================================${NC}"
+
+GENESIS_TIMESTAMP=$(date -d "${GENESIS_TIME}" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S+00:00" "${GENESIS_TIME}" +%s)
+
+while true; do
+    NOW=$(date +%s)
+    REMAINING=$((GENESIS_TIMESTAMP - NOW))
+
+    if [ $REMAINING -le 0 ]; then
+        echo -e "\n${GREEN}✓ 创世时间已到达！区块产生已开始${NC}"
+        break
+    fi
+
+    echo -ne "\r${YELLOW}倒计时: ${REMAINING} 秒...${NC}"
+    sleep 1
+done
+
 echo ""
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}启动完成！${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
+echo "创世时间: ${GENESIS_TIME}"
 echo "查看日志: tail -f logs/node-0.log"
 echo "查看所有日志: ls logs/"
 echo "停止网络: ./scripts/stop_network.sh 或按 Ctrl+C"
