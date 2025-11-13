@@ -1,6 +1,9 @@
 package types
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // network.go
 // 网络数据结构定义
@@ -9,6 +12,8 @@ import "time"
 // Network DPoS网络
 // 核心管理结构，协调所有节点和共识流程
 type Network struct {
+	mu sync.RWMutex //添加互斥锁保护所有字段
+
 	// ================================
 	// 节点管理
 	// ================================
@@ -193,4 +198,98 @@ type RoundSummary struct {
 
 	// 关键事件
 	KeyEvents []string // 例如：节点掉线、作恶行为、权重归零等
+}
+
+// ===== 线程安全的访问方法 =====
+
+// AddNode 添加节点（线程安全）
+func (n *Network) AddNode(node *Node) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// 检查是否已存在
+	for i, existingNode := range n.Nodes {
+		if existingNode.ID == node.ID {
+			n.Nodes[i] = node
+			return
+		}
+	}
+
+	n.Nodes = append(n.Nodes, node)
+}
+
+// GetNodes 获取所有节点（线程安全）
+func (n *Network) GetNodes() []*Node {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	nodes := make([]*Node, len(n.Nodes))
+	copy(nodes, n.Nodes)
+	return n.Nodes
+}
+
+// UpdateNode 更新节点（线程安全）
+func (n *Network) UpdateNode(nodeID string, node *Node) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for i, existingNode := range n.Nodes {
+		if existingNode.ID == nodeID {
+			n.Nodes[i] = node
+			return true
+		}
+	}
+
+	return false
+}
+
+// RemoveNode 移除节点（线程安全）
+func (n *Network) RemoveNode(nodeID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for i, node := range n.Nodes {
+		if node.ID == nodeID {
+			n.Nodes = append(n.Nodes[:i], n.Nodes[i+1:]...)
+			return
+		}
+	}
+}
+
+// SetDelegates 设置代理节点（线程安全）
+func (n *Network) SetDelegates(delegates []*Node) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.Delegates = delegates
+}
+
+// GetDelegates 获取代理节点（线程安全）
+func (n *Network) GetDelegates() []*Node {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	delegates := make([]*Node, len(n.Delegates))
+	copy(delegates, n.Delegates)
+	return delegates
+}
+
+// UpdateStats 更新网络统计（线程安全）
+func (n *Network) UpdateStats(stats NetworkStats) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.TotalWeight = stats.TotalWeight
+	n.EnvironmentWeight = stats.EnvironmentWeight
+	n.AverageWeight = stats.AverageWeight
+	n.ActiveNodesCount = stats.ActiveNodesCount
+	n.SystemNetworkDelay = stats.SystemNetworkDelay
+}
+
+// NetworkStats 网络统计数据
+type NetworkStats struct {
+	TotalWeight        float64
+	EnvironmentWeight  float64
+	AverageWeight      float64
+	ActiveNodesCount   int
+	SystemNetworkDelay float64
 }

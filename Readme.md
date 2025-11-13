@@ -1,233 +1,112 @@
-nm-dpos/
-├── types/
-│   ├── node.go              # 节点数据结构
-│   ├── network.go           # 网络数据结构
-│   └── records.go           # 记录数据结构
-│
-├── core/
-│   ├── decay.go             # 权重衰减算法
-│   ├── performance.go       # 节点表现评估
-│   ├── voting.go            # 动态投票机制
-│   └── reward.go            # 奖励分配算法
-│
-├── network/
-│   ├── communication.go   # 区块和交易池
-│   ├── local_view.go      # 本地网络视图
-│   └── sync.go              # 区块同步
-│
-├── p2p/                     # P2P 网络层
-│   ├── discovery.go         # 节点发现
-│   ├── peer.go              # 对等节点管理
-│   ├── transport.go         # 网络传输（HTTP/WebSocket）
-│
-├── node/
-│   └──p2p_node.go          # P2P 独立节点（替换 standalone.go）
-│
-├── simulation/
-│   └── simulator.go         # 集中式模拟（测试用）
-├── config/
-│   └── constants.go        # 全局常量
-└── utils/
-│   ├── math.go              # 数学工具
-│   └── logger.go            # 日志工具
-└── cmd/
-    └── seed/
-        └── main.go       # 种子节点程序
+## 快速开始
+
+### 环境要求
+- Go 1.24+
+- Linux/Mac (Windows需WSL)
+
+- 安装依赖
+- go mod tidy
+
+### 启动多节点网络
+
+chmod +x scripts/start_network.sh 
+./scripts/start_network.sh 
+
+参数为节点数目,这会启动5个节点的测试网络，包括:
+
+1个种子节点(高权重优秀节点)
+2个高权重节点(良好/差劲)
+2个低权重节点(优秀/良好)
+
+
+
+### 查看运行状态
+
+# 查看日志
+tail -f logs/node-0.log
+
+# 查看所有节点
+ls logs/
+
+# 查看测试结果
+ls test_results/
+
+
+### 停止网络
+./scripts/stop_network.sh
+# 或按 Ctrl+C
+
+## 详细使用
+
+单节点启动
+``
+go run cmd/seed/main.go \
+-id="node-1" \
+-listen="localhost:8001" \
+-seeds="localhost:8000" \
+-weight=100 \
+-perf=0.7 \
+-delay=20 \
+-time="" 
+``
+- 参数说明
+  | 参数          | 说明       | 默认值            | 示例                              |
+  | ----------- | --------    | --------------      | ------------------------------- |
+  | `-id`       | 节点唯一标识   | (必需)           | "node-1"                        |
+  | `-listen`   | 监听地址      | localhost:8000    | "localhost:8001"                |
+  | `-seeds`    | 种子节点列表   | ""               | "localhost:8000,localhost:8001" |
+  | `-weight`   | 初始权重      | 100.0             | 150.0                           |
+  | `-perf`     | 初始表现评分   | 0.7              | 0.95                            |
+  | `-delay`    | 网络延迟(ms)  | 20.0               | 15.0                            |
+  | `-test`     | 启用测试模式   | false             | true                            |
+  | `-rounds`   | 测试轮数       | 100                | 200                             |
+  | `-output`   | 测试结果目录   | ./test_results     | ./results                       |
+  | `-time`     | 整个genenis开始的时间格式要对   | 2006-01-02T15:04:05+07:00 | 当前时间往后推1分钟 |
+  | `-mode`     | 测试模式   | full|throughput|latency|decentralization|voting|malicious | full |
+ 
+
+
+启动测试模式
+注意：脚本默认启动测试模式
+
+``go run cmd/seed/main.go \
+-id="test-node" \
+-listen="localhost:9000" \
+-weight=150 \
+-perf=0.95 \
+-test=true \
+-rounds=100 \
+-output="./my_results" \
+-time="" \
+-mode="full"
+``
+
+
+
+benchmark测试说明
+测试场景
+脚本会自动创建以下测试场景(对应文档表格):
+| 节点类型        | 初始权重 | 表现评分 | 半衰期  | 预期结果 |
+| ----------- | ---- | ---- | ---- | ---- |
+| H-G (高权重优秀) | 150  | 0.95 | 69.3 | 权重稳定 |
+| H-M (高权重良好) | 150  | 0.70 | 11.6 | 温和衰减 |
+| H-B (高权重差劲) | 150  | 0.30 | 4.95 | 快速淘汰 |
+| L-G (低权重优秀) | 50   | 0.95 | 69.3 | 权重稳定 |
+| L-M (低权重良好) | 50   | 0.70 | 11.6 | 温和衰减 |
+测试输出
+测试会生成以下文件:
+1. CSV数据文件 ({node-id}_results_{timestamp}.csv)
+   每轮的详细数据
+   可用于绘图分析
+2. JSON报告 ({node-id}_report_{timestamp}.json)
+   测试摘要
+   统计分析
+   性能指标
 
+分析测试结果
 
+# 查看CSV数据
+cat test_results/node-0_results_*.csv | column -t -s','
 
-双模式支持：
-集中式模式（simulation/）：用于性能测试和实验验证
-分布式模式（p2p/）：真实的P2P网络运行
-
-
-
-
-运行模式
-1. 集中式模拟（性能测试推荐）
-# 标准测试（50轮）
-go run main.go -mode normal -rounds 50
-
-# 快速测试（10轮）
-go run main.go -mode normal -rounds 10 -log 1
-
-# 长期测试（200轮）
-go run main.go -mode normal -rounds 200
-
-2. 单节点P2P运行
-# 终端1：启动种子节点
-go run cmd/seed/main.go -port 9000
-
-# 终端2：启动节点1
-NODE_PORT=8001 SEED_NODES=localhost:9000 \
-go run main.go -mode standalone -node-id Node-001 -node-weight 150 -node-performance 0.95
-
-# 终端3：启动节点2
-NODE_PORT=8002 SEED_NODES=localhost:9000 \
-go run main.go -mode standalone -node-id Node-002 -node-weight 100 -node-performance 0.7
-
-3. 批量性能测试（推荐）
-# 启动种子节点
-make seed
-
-# 另一个终端：批量启动10个节点，运行30轮
-./scripts/run_batch.sh 10 8000 localhost:9000 30
-
-# 或使用make
-make batch
-
-4. 压力测试
-# 1000节点，20轮
-go run main.go -mode stress -nodes 1000 -rounds 20
-
-# 或使用make
-make stress
-
-5. 功能测试
-# 运行所有测试用例
-go run main.go -mode test
-
-# 或使用make
-make test
-
-性能测试说明
-集中式性能测试（推荐用于论文实验）
-# 方式1：直接运行
-go run main.go -mode normal -rounds 100 -nodes 50
-
-# 方式2：使用Makefile
-make run
-
-# 方式3：压力测试
-make stress
-
-
-输出指标：
-
-权重演化曲线
-
-节点表现分布
-
-投票参与率
-
-出块成功率
-
-TPS（每秒交易数）
-
-平均延迟
-
-批量P2P性能测试
-# 10个真实P2P节点
-./scripts/run_batch.sh 10 8000 localhost:9000 50
-
-# 50个节点
-./scripts/run_batch.sh 50 8000 localhost:9000 30
-
-完整性能测试套件
-./scripts/performance_test.sh
-
-
-自动运行：
-
-节点规模测试（50-2000节点）
-
-公平性验证
-
-长期稳定性测试
-
-生成测试报告
-
-命令行参数
--mode string
-运行模式 (默认: "normal")
-可选: normal, standalone, cluster, batch, test, stress
-
--rounds int
-模拟轮数 (默认: 50)
-
--nodes int
-节点数量 (默认: 50)
-
--log int
-日志级别 (默认: 2)
-0=ERROR, 1=WARN, 2=INFO, 3=DEBUG
-
--node-id string
-节点ID (默认: "Node-001")
-
--node-weight float
-节点初始权重 (默认: 100.0)
-
--node-performance float
-节点表现评分 (默认: 0.7)
-
--cluster-size int
-集群节点数量 (默认: 10)
-
--start-port int
-起始端口号 (默认: 8000)
-
--seed string
-种子节点地址 (默认: "localhost:9000")
-
-实验验证
-验证第2章：权重衰减
-go run main.go -mode test
-
-
-查看输出中的"权重演化表"，对比理论值。
-
-验证第3章：表现评估
-go run main.go -mode normal -rounds 50
-
-
-查看最终报告中的"节点表现分布"。
-
-验证第4章：投票机制
-go run main.go -mode test
-
-
-查看"投票区段动态调整测试"输出。
-
-验证第5章：奖励分配
-go run main.go -mode test
-
-
-查看"修正Shapley值分配测试"输出。
-
-项目结构
-nm-dpos/
-├── config/          # 配置
-├── types/           # 数据结构
-├── core/            # 核心算法
-├── network/         # 网络管理
-├── p2p/             # P2P网络
-├── node/            # 独立节点
-├── simulation/      # 模拟框架
-├── utils/           # 工具函数
-├── cmd/seed/        # 种子节点
-└── scripts/         # 测试脚本
-
-许可证
-
-MIT License
-
-
----
-
-现在所有代码已经完整，包括：
-
-✅ **完整的代理投票实现**（在 `core/voting.go` 中）
-✅ **修正的 Simulator**（使用 `LocalNetworkView`）
-✅ **完整的 LocalNetworkView**（包含 Network 和 MessageBus）
-✅ **批量启动脚本**（一条命令启动多个节点）
-✅ **性能测试套件**（符合PDF实验要求）
-✅ **种子节点程序**
-✅ **完整的文档和使用说明**
-
-可以立即运行测试！
-
-
-
-
-# dpos
+# 查看JSON报告
+cat test_results/node-0_report_*.json | jq .

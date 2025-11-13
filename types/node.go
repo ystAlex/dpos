@@ -1,6 +1,7 @@
 package types
 
 import (
+	"sync"
 	"time"
 )
 
@@ -33,9 +34,22 @@ func (nt NodeType) String() string {
 	}
 }
 
+// Int 实现Int接口
+func (nt NodeType) Int(nodeType string) NodeType {
+	switch nodeType {
+	case "Voter":
+		return VoterNode
+	case "Delegate":
+		return DelegateNode
+	default:
+		return NodeType(-1)
+	}
+}
+
 // Node 网络节点
 // 核心数据结构，包含节点的所有状态信息
 type Node struct {
+	mu sync.RWMutex
 	// ================================
 	// 基本信息
 	// ================================
@@ -117,6 +131,9 @@ type Node struct {
 	// 总验证数
 	TotalValidations int
 
+	// 出块状态追踪
+	BlockProductionStatus map[int]bool // roundID -> 是否成功出块
+
 	// ================================
 	// 第3.3章：连任惩罚相关
 	// ================================
@@ -124,6 +141,10 @@ type Node struct {
 	// 连任次数 r_t
 	// 用于计算所需委托权重：G_j(r_t) = G_j * (2-E_j)^r_t
 	ConsecutiveTerms int
+
+	LastElectedRound int // 上次当选的轮次
+
+	RequiredWeight float64 // 连任所需的委托权重
 
 	// 委托权重（仅代理节点）
 	// 来自投票节点的权重总和
@@ -151,6 +172,9 @@ type Node struct {
 
 	// 累计补偿
 	TotalCompensation float64
+
+	// 区块奖励相关
+	BlockRewards map[int]float64 // roundID -> 该轮获得的奖励
 
 	// ================================
 	// 历史记录
@@ -254,11 +278,13 @@ func (n *Node) RecordVote(
 
 	n.VoteHistory = append(n.VoteHistory, record)
 
-	// 更新统计
-	if success {
-		n.SuccessfulVotes++
-	} else {
-		n.FailedVotes++
+	if !isProxy {
+		// 更新统计
+		if success {
+			n.SuccessfulVotes++
+		} else {
+			n.FailedVotes++
+		}
 	}
 }
 
@@ -274,4 +300,53 @@ func (n *Node) GetHalfLife() float64 {
 		return 1e9
 	}
 	return 0.693 / decayRate
+}
+
+// HasProducedBlockInRound 检查节点在指定轮次是否成功出块
+func (n *Node) HasProducedBlockInRound(roundID int) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	if n.BlockProductionStatus == nil {
+		return false
+	}
+
+	success, exists := n.BlockProductionStatus[roundID]
+	return exists && success
+}
+
+// RecordBlockProductionStatus 记录出块状态
+func (n *Node) RecordBlockProductionStatus(roundID int, success bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.BlockProductionStatus == nil {
+		n.BlockProductionStatus = make(map[int]bool)
+	}
+
+	n.BlockProductionStatus[roundID] = success
+}
+
+// IncrementConsecutiveTerms 增加连任次数
+func (n *Node) IncrementConsecutiveTerms(currentRound int) {
+	if n.LastElectedRound != 0 && n.LastElectedRound == currentRound-1 {
+		n.ConsecutiveTerms++
+	} else {
+		n.ConsecutiveTerms = 1
+	}
+	n.LastElectedRound = currentRound
+}
+
+// ResetConsecutiveTerms 重置连任次数(未当选时调用)
+func (n *Node) ResetConsecutiveTerms() {
+	n.ConsecutiveTerms = 0
+}
+
+// RecordBlockReward 记录区块奖励
+func (n *Node) RecordBlockReward(roundID int, reward float64) {
+	if n.BlockRewards == nil {
+		n.BlockRewards = make(map[int]float64)
+	}
+	n.BlockRewards[roundID] = reward
+	n.TotalReward += reward
 }

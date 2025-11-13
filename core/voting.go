@@ -7,6 +7,7 @@ import (
 	"nm-dpos/types"
 	"nm-dpos/utils"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -22,23 +23,38 @@ import (
 type VotingPhase int
 
 const (
-	NormalVotingPhase VotingPhase = iota // 正常投票区段
-	ProxyVotingPhase                     // 代投区段
-	VotingClosed                         // 投票结束
+	VotingPrepare  VotingPhase = iota // 准备阶段
+	VotingActive                      // 投票进行中
+	VotingProxy                       // 代投阶段
+	VotingFinished                    // 已完成
 )
 
 // VotingSession 投票会话
 // 管理一轮投票的完整过程
 type VotingSession struct {
-	RoundID                 int                // 轮次ID
-	NormalPeriod            float64            // 正常投票区段（毫秒）
-	ProxyPeriod             float64            // 代投区段（毫秒）
-	StartTime               time.Time          // 开始时间
-	Voters                  []*types.Node      // 投票节点列表
-	Candidates              []*types.Node      // 候选节点列表
-	SuccessfulVoters        []*types.Node      // 成功投票节点
-	ProxiedVoters           map[string]string  // 代投映射：被代投者ID -> 代投者ID
-	FailedVoters            []*types.Node      // 失败投票节点
+	mu             sync.RWMutex
+	RoundID        int       // 轮次ID
+	NormalPeriod   float64   // 正常投票区段（毫秒）
+	ProxyPeriod    float64   // 代投区段（毫秒）
+	StartTime      time.Time //正常投票开始时间
+	ProxyStartTime time.Time // 代投投票开始时间
+	EndTime        time.Time // 整个流程结束时间
+	Phase          VotingPhase
+	// 参与者
+	Voters     []*types.Node // 投票节点列表
+	Candidates []*types.Node // 候选节点列表
+
+	// 投票记录 (nodeID -> targetID)
+	VoteRecords map[string]string
+	// 投票时间记录 (nodeID -> votingTime)
+	VoteTimes map[string]float64
+
+	// 分类结果
+	SuccessfulVoters []*types.Node     // 成功投票节点
+	ProxiedVoters    map[string]string // 代投映射：被代投者ID -> 代投者ID
+	FailedVoters     []*types.Node     // 失败投票节点
+
+	// 统计数据
 	VoteResults             map[string]float64 // 投票结果：候选节点ID -> 获得权重
 	TotalDeductedWeight     float64            // 扣除的总权重
 	TotalConfiscatedDeposit float64            // 没收的保证金总额
@@ -46,14 +62,18 @@ type VotingSession struct {
 }
 
 // NewVotingSession 创建新的投票会话
-func NewVotingSession(roundID int, normalPeriod float64, voters, candidates []*types.Node) *VotingSession {
+func NewVotingSession(roundID int, normalPeriod float64, voters, candidates []*types.Node, startTime time.Time) *VotingSession {
 	return &VotingSession{
 		RoundID:                 roundID,
 		NormalPeriod:            normalPeriod,
 		ProxyPeriod:             config.ProxyPeriodEnd - config.ProxyPeriodStart,
-		StartTime:               time.Now(),
+		StartTime:               startTime,
+		ProxyStartTime:          startTime.Add(time.Duration(normalPeriod) * time.Millisecond),
+		EndTime:                 startTime.Add(time.Duration(normalPeriod+config.ProxyPeriodEnd-config.ProxyPeriodStart) * time.Millisecond),
 		Voters:                  voters,
 		Candidates:              candidates,
+		VoteRecords:             make(map[string]string),
+		VoteTimes:               make(map[string]float64),
 		SuccessfulVoters:        make([]*types.Node, 0),
 		ProxiedVoters:           make(map[string]string),
 		FailedVoters:            make([]*types.Node, 0),
@@ -62,6 +82,68 @@ func NewVotingSession(roundID int, normalPeriod float64, voters, candidates []*t
 		TotalConfiscatedDeposit: 0,
 		HotCompensationPool:     0,
 	}
+}
+
+// RecordVote 记录投票(线程安全)
+func (vs *VotingSession) RecordVote(voterID, targetID string, votingTime float64) {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
+	vs.VoteRecords[voterID] = targetID
+	vs.VoteTimes[voterID] = votingTime
+
+	// ✅ 更新目标节点的委托权重
+	for _, candidate := range vs.Candidates {
+		if candidate.ID == targetID {
+			// 找到投票者的权重
+			for _, voter := range vs.Voters {
+				if voter.ID == voterID {
+					vs.VoteResults[targetID] += voter.CurrentWeight
+					candidate.DelegatedWeight += voter.CurrentWeight // 累计委托权重
+					break
+				}
+			}
+			break
+		}
+	}
+	// 判断是否在正常区段
+	if votingTime <= vs.NormalPeriod {
+		for _, voter := range vs.Voters {
+			if voter.ID == voterID {
+				vs.SuccessfulVoters = append(vs.SuccessfulVoters, voter)
+				//for i, failed := range vs.FailedVoters {
+				//	if failed.ID == voter.ID {
+				//		failedVoters := append(vs.FailedVoters[:i], vs.FailedVoters[i+1:]...)
+				//		vs.FailedVoters = failedVoters
+				//	}
+				//}
+				break
+			}
+		}
+	}
+}
+
+func (vs *VotingSession) RecordProxyVote(voterID, proxyID string) {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
+	vs.ProxiedVoters[voterID] = proxyID
+}
+
+// GetNodesNeedingProxy 获取需要代投的节点
+func (vs *VotingSession) GetNodesNeedingProxy() []*types.Node {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	needProxy := make([]*types.Node, 0)
+	for _, voter := range vs.Voters {
+		if _, voted := vs.VoteRecords[voter.ID]; !voted {
+			// 未投票的节点需要代投
+			needProxy = append(needProxy, voter)
+		}
+	}
+
+	return needProxy
 }
 
 // ================================
@@ -100,246 +182,64 @@ func CalculateNormalVotingPeriod(nodes []*types.Node, systemDelay float64, votin
 }
 
 // ================================
-// 第4章主流程：投票执行
+// 代投机制
 // ================================
 
-// ConductVoting 执行投票阶段
-// 完整流程：正常投票 -> 代投 -> 失败处理
-//
-// 参数：
-//   - session: 投票会话
-//
-// 返回：投票统计信息
-func ConductVoting(session *VotingSession) *types.VotingStatistics {
-	// 第一阶段：正常投票
-	normalVoters := conductNormalVoting(session)
+// GetProxyNodes 查看代投信息
+// delegates 当前的代理节点的集合
+func (vs *VotingSession) GetProxyNodes(delegates []*types.Node) []*types.Node {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 
-	// 第二阶段：代投
-	proxiedVoters := conductProxyVoting(session, normalVoters)
+	vs.Phase = VotingProxy
 
-	// 第三阶段：失败处理
-	failedVoters := handleVotingFailures(session)
+	proxyNodes := make([]*types.Node, 0)
 
-	// 统计结果
-	stats := &types.VotingStatistics{
-		TotalVoters:       len(session.Voters),
-		SuccessfulVoters:  len(normalVoters),
-		ProxiedVoters:     len(proxiedVoters),
-		FailedVoters:      len(failedVoters),
-		NormalPeriod:      session.NormalPeriod,
-		ProxyPeriod:       session.ProxyPeriod,
-		ParticipationRate: float64(len(normalVoters)+len(proxiedVoters)) / float64(len(session.Voters)),
-	}
+	// 选择代投节点(按投票速度排序,按照顺序选择即可)
+	proxyNodes = selectProxyNodes(vs.SuccessfulVoters, vs.VoteTimes, delegates)
 
-	// 计算平均投票时间
-	totalTime := 0.0
-	for _, voter := range normalVoters {
-		if len(voter.VoteHistory) > 0 {
-			totalTime += voter.VoteHistory[len(voter.VoteHistory)-1].TimeCost
-		}
-	}
-	if len(normalVoters) > 0 {
-		stats.AverageVotingTime = totalTime / float64(len(normalVoters))
-	}
-
-	return stats
+	return proxyNodes
 }
 
-// conductNormalVoting 执行正常投票阶段
-// 模拟节点在正常投票区段内的投票行为
-func conductNormalVoting(session *VotingSession) []*types.Node {
-	successfulVoters := make([]*types.Node, 0)
+// selectProxyNodes 选择代投节点
+func selectProxyNodes(voters []*types.Node, voteTimes map[string]float64, currentDelegates []*types.Node) []*types.Node {
+	type voterWithTime struct {
+		node *types.Node
+		time float64
+	}
 
-	for _, voter := range session.Voters {
-		if !voter.IsActive || voter.Type != types.VoterNode {
-			continue
+	candidates := make([]voterWithTime, 0)
+	for _, voter := range voters {
+		if t, ok := voteTimes[voter.ID]; ok {
+			candidates = append(candidates, voterWithTime{voter, t})
 		}
+	}
 
-		// 模拟投票时间：基础网络延迟 + 随机处理时间
-		votingTime := voter.NetworkDelay + rand.Float64()*20.0
+	// 按投票时间升序排序
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].time < candidates[j].time
+	})
 
-		// 判断是否在正常投票区段内完成
-		if votingTime <= session.NormalPeriod {
-			// 随机选择一个候选节点投票
-			if len(session.Candidates) > 0 {
-				targetIdx := rand.Intn(len(session.Candidates))
-				target := session.Candidates[targetIdx]
-
-				// 记录投票
-				voter.RecordVote(
-					target.ID,
-					voter.CurrentWeight,
-					votingTime,
-					0, // 暂无补偿
-					true,
-					false,
-					"",
-				)
-
-				// 更新投票结果
-				session.VoteResults[target.ID] += voter.CurrentWeight
-
-				// 添加到成功投票列表
-				successfulVoters = append(successfulVoters, voter)
-				session.SuccessfulVoters = append(session.SuccessfulVoters, voter)
+	result := make([]*types.Node, 0)
+	for _, c := range candidates {
+		for _, delegate := range currentDelegates {
+			if delegate.ID == c.node.ID {
+				result = append(result, c.node)
 			}
 		}
 	}
 
-	return successfulVoters
+	return result
 }
 
-// ================================
-// 第4.3节：代投机制
-// ================================
-
-// conductProxyVoting 执行代投阶段
-// 为未能在正常区段完成投票的节点安排代投
-//
-// 参数：
-//   - session: 投票会话
-//   - normalVoters: 已成功投票的节点列表
-//
-// 返回：被代投的节点列表
-func conductProxyVoting(session *VotingSession, normalVoters []*types.Node) []*types.Node {
-	// 找出需要代投的节点
-	needProxyVoters := findNodesNeedingProxy(session, normalVoters)
-	if len(needProxyVoters) == 0 {
-		return []*types.Node{}
-	}
-
-	// 选择代投节点（按投票速度排序）
-	proxyNodes := selectProxyNodes(normalVoters)
-	if len(proxyNodes) == 0 {
-		return []*types.Node{}
-	}
-
-	proxiedVoters := make([]*types.Node, 0)
-
-	// 为每个需要代投的节点分配代投者
-	for i, needProxyVoter := range needProxyVoters {
-		if i >= len(proxyNodes) {
-			// 代投节点不足，剩余节点将投票失败
-			break
-		}
-
-		proxyNode := proxyNodes[i]
-
-		// 随机选择候选节点
-		if len(session.Candidates) > 0 {
-			targetIdx := rand.Intn(len(session.Candidates))
-			target := session.Candidates[targetIdx]
-
-			// 计算代投补偿（第4.3节公式）
-			compensation := calculateProxyCompensation(needProxyVoter, session.ProxyPeriod)
-
-			// 代投者记录（获得补偿）
-			proxyNode.RecordVote(
-				target.ID,
-				needProxyVoter.CurrentWeight,
-				0, // 代投耗时记为0
-				compensation,
-				true,
-				true,
-				needProxyVoter.ID,
-			)
-			proxyNode.TotalCompensation += compensation
-
-			// 被代投者记录
-			needProxyVoter.RecordVote(
-				target.ID,
-				needProxyVoter.CurrentWeight,
-				session.NormalPeriod, // 视为在临界点投票
-				0,
-				true,
-				false,
-				"",
-			)
-
-			// 更新投票结果
-			session.VoteResults[target.ID] += needProxyVoter.CurrentWeight
-
-			// 记录代投关系
-			session.ProxiedVoters[needProxyVoter.ID] = proxyNode.ID
-
-			proxiedVoters = append(proxiedVoters, needProxyVoter)
-		}
-	}
-
-	return proxiedVoters
-}
-
-// findNodesNeedingProxy 找出需要代投的节点
-// 条件：活跃 + 未在正常区段投票
-func findNodesNeedingProxy(session *VotingSession, normalVoters []*types.Node) []*types.Node {
-	// 构建已投票节点ID集合
-	votedIDs := make(map[string]bool)
-	for _, voter := range normalVoters {
-		votedIDs[voter.ID] = true
-	}
-
-	needProxy := make([]*types.Node, 0)
-	for _, voter := range session.Voters {
-		if voter.IsActive && !votedIDs[voter.ID] {
-			needProxy = append(needProxy, voter)
-		}
-	}
-
-	return needProxy
-}
-
-// selectProxyNodes 选择代投节点
-// 按投票速度排序，选择最快的节点
-func selectProxyNodes(normalVoters []*types.Node) []*types.Node {
-	// 创建副本并按投票速度排序
-	proxyCandidates := make([]*types.Node, len(normalVoters))
-	copy(proxyCandidates, normalVoters)
-
-	sort.Slice(proxyCandidates, func(i, j int) bool {
-		// 获取最近一次投票的耗时
-		iTime := getLastVoteTime(proxyCandidates[i])
-		jTime := getLastVoteTime(proxyCandidates[j])
-		return iTime < jTime
-	})
-
-	return proxyCandidates
-}
-
-// getLastVoteTime 获取节点最近一次投票的耗时
-func getLastVoteTime(node *types.Node) float64 {
-	if len(node.VoteHistory) == 0 {
-		return 999999.0 // 无历史记录，排在最后
-	}
-	lastVote := node.VoteHistory[len(node.VoteHistory)-1]
-	return lastVote.TimeCost
-}
-
-// calculateProxyCompensation 计算代投补偿
-// 公式：S_comp = F_i(t_e) - F_i(t_s)
-// 即宕机节点在代投期间衰减的权重
-//
-// 参数：
-//   - proxiedNode: 被代投节点
-//   - proxyPeriodDuration: 代投区段时长（毫秒）
-//
-// 返回：补偿权重
-func calculateProxyCompensation(proxiedNode *types.Node, proxyPeriodDuration float64) float64 {
-	// 将毫秒转换为周期（假设1个周期=1000毫秒）
+// CalculateProxyCompensation 计算代投补偿
+func CalculateProxyCompensation(proxiedNode *types.Node, proxyPeriodDuration float64) float64 {
 	timePeriods := proxyPeriodDuration / 1000.0
-
-	// 计算代投前的权重
 	weightBefore := proxiedNode.CurrentWeight
 
-	// 计算代投后的权重（使用衰减公式）
 	decayRate := CalculateDecayRate(proxiedNode.PerformanceScore)
-	weightAfter := utils.NewtonCooling(
-		weightBefore,
-		0, // envWeight = 0
-		decayRate,
-		timePeriods,
-	)
+	weightAfter := utils.NewtonCooling(weightBefore, 0, decayRate, timePeriods)
 
-	// 补偿 = 衰减掉的权重
 	compensation := weightBefore - weightAfter
 	if compensation < 0 {
 		compensation = 0
@@ -349,88 +249,91 @@ func calculateProxyCompensation(proxiedNode *types.Node, proxyPeriodDuration flo
 }
 
 // ================================
-// 第4.4节：投票失败处理
+// 失败处理
 // ================================
 
-// handleVotingFailures 处理投票失败的节点
-// 失败定义：超时且无代投节点可用
-//
-// 参数：
-//   - session: 投票会话
-//
-// 返回：失败节点列表
-func handleVotingFailures(session *VotingSession) []*types.Node {
-	// 找出所有未成功投票的节点
-	votedIDs := make(map[string]bool)
-	for _, voter := range session.SuccessfulVoters {
-		votedIDs[voter.ID] = true
-	}
-	for voterID := range session.ProxiedVoters {
-		votedIDs[voterID] = true
-	}
+// ProcessFailures 处理投票失败节点
+func (vs *VotingSession) ProcessFailures() []*types.Node {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 
 	failedVoters := make([]*types.Node, 0)
 
-	for _, voter := range session.Voters {
+	for _, voter := range vs.Voters {
 		if !voter.IsActive {
 			continue
 		}
 
-		if !votedIDs[voter.ID] {
-			// 投票失败，执行惩罚
-			applyVoteFailurePenalty(voter)
-			session.FailedVoters = append(session.FailedVoters, voter)
-			failedVoters = append(failedVoters, voter)
+		// 检查是否已投票或被代投
+		_, voted := vs.VoteRecords[voter.ID]
+		_, proxied := vs.ProxiedVoters[voter.ID]
 
-			// 累计扣除的权重
-			session.TotalDeductedWeight += voter.CurrentWeight * config.VoteFailurePenalty
+		if !voted && !proxied {
+			// 完全失败,执行惩罚
+			deductedWeight := voter.CurrentWeight * config.VoteFailurePenalty
+			voter.CurrentWeight -= deductedWeight
+
+			confiscated := voter.Deposit
+			voter.Deposit = 0
+
+			vs.TotalDeductedWeight += deductedWeight
+			vs.TotalConfiscatedDeposit += confiscated
+
+			var flag = false
+			for _, voter1 := range vs.FailedVoters {
+				if voter1.ID == voter.ID {
+					flag = true
+				}
+			}
+			if !flag {
+				vs.FailedVoters = append(vs.FailedVoters, voter)
+			}
+			failedVoters = append(failedVoters, voter)
+			// 记录失败
+			RecordVoteFailure(voter)
 		}
 	}
 
 	return failedVoters
 }
 
-// applyVoteFailurePenalty 对投票失败节点应用惩罚
-// 第5.1节：四种投票结果 - 情况A（未投票）
-//
-// 惩罚措施：
-//  1. 扣除权重的10%
-//  2. 没收保证金
-//  3. 记录失败次数
-func applyVoteFailurePenalty(node *types.Node) {
-	// 1. 扣除权重
-	deductedWeight := node.CurrentWeight * config.VoteFailurePenalty
-	node.CurrentWeight -= deductedWeight
-
-	// 2. 没收保证金
-	node.Deposit = 0
-
-	// 3. 记录失败
-	RecordVoteFailure(node)
-}
-
 // ================================
-// 辅助函数
+// 统计函数
 // ================================
 
-// SimulateVotingTime 模拟投票时间
-// 基于节点网络延迟和随机处理时间
-func SimulateVotingTime(node *types.Node) float64 {
-	// 基础延迟 + 处理时间（20ms内随机）
-	return node.NetworkDelay + rand.Float64()*20.0
-}
+// GetStatistics 获取投票统计
+func (vs *VotingSession) GetStatistics() *types.VotingStatistics {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
 
-// GetVotingPhase 获取当前投票阶段
-func GetVotingPhase(elapsedTime, normalPeriod, proxyEnd float64) VotingPhase {
-	if elapsedTime <= normalPeriod {
-		return NormalVotingPhase
-	} else if elapsedTime <= proxyEnd {
-		return ProxyVotingPhase
+	totalVoted := len(vs.VoteRecords)
+	proxiedCount := len(vs.ProxiedVoters)
+	normalCount := len(vs.SuccessfulVoters)
+	failedCount := len(vs.FailedVoters)
+
+	// 计算平均投票时间
+	totalTime := 0.0
+	for _, t := range vs.VoteTimes {
+		totalTime += t
 	}
-	return VotingClosed
+	avgTime := 0.0
+	if len(vs.VoteTimes) > 0 {
+		avgTime = totalTime / float64(len(vs.VoteTimes))
+	}
+
+	return &types.VotingStatistics{
+		TotalVoters:       len(vs.Voters),
+		SuccessfulVoters:  normalCount,
+		ProxiedVoters:     proxiedCount,
+		FailedVoters:      failedCount,
+		NormalPeriod:      vs.NormalPeriod,
+		ProxyPeriod:       vs.ProxyPeriod,
+		ParticipationRate: float64(totalVoted) / float64(len(vs.Voters)),
+		AverageVotingTime: avgTime,
+	}
 }
 
-// ValidateVotingSession 验证投票会话的有效性
+// ValidateVotingSession 验证会话有效性
 func ValidateVotingSession(session *VotingSession) error {
 	if len(session.Voters) == 0 {
 		return fmt.Errorf("no voters in session")
@@ -442,4 +345,19 @@ func ValidateVotingSession(session *VotingSession) error {
 		return fmt.Errorf("invalid normal period: %f", session.NormalPeriod)
 	}
 	return nil
+}
+
+// SimulateVotingTime 模拟投票时间
+func SimulateVotingTime(node *types.Node) float64 {
+	return node.NetworkDelay + rand.Float64()*20.0
+}
+
+// IsExpired 检查投票会话是否已过期
+// 返回 true 表示会话已结束，不应再处理投票
+func (vs *VotingSession) IsExpired() bool {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	now := time.Now().UTC()
+	return now.After(vs.EndTime)
 }

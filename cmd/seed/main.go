@@ -1,137 +1,151 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
-	"net/http"
-	"nm-dpos/p2p"
-	"sync"
+	"nm-dpos/config"
+	"nm-dpos/node"
+	"nm-dpos/test"
+	"nm-dpos/utils"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 )
 
-// 种子节点程序
-// 用于帮助新节点发现网络中的其他节点
+var (
+	// 节点配置
+	nodeID        = flag.String("id", "", "节点ID")
+	listenAddr    = flag.String("listen", "localhost:8000", "监听地址")
+	seedNodes     = flag.String("seeds", "", "种子节点地址列表，逗号分隔")
+	initialTime   = flag.String("time", "2006-01-02T15:04:05+07:00", "整个系统初始化的时间")
+	initialWeight = flag.Float64("weight", 100.0, "初始权重")
+	performance   = flag.Float64("perf", 0.7, "初始表现评分")
+	networkDelay  = flag.Float64("delay", 20.0, "网络延迟(ms)")
 
-type SeedNode struct {
-	mu              sync.RWMutex
-	registeredNodes map[string]*p2p.PeerInfo
-	listenAddress   string
-}
-
-func NewSeedNode(listenAddress string) *SeedNode {
-	return &SeedNode{
-		registeredNodes: make(map[string]*p2p.PeerInfo),
-		listenAddress:   listenAddress,
-	}
-}
-
-func (sn *SeedNode) Start() error {
-	mux := http.NewServeMux()
-
-	// 节点注册
-	mux.HandleFunc("/register", sn.handleRegister)
-
-	// 节点列表查询
-	mux.HandleFunc("/peers", sn.handlePeers)
-
-	// 心跳
-	mux.HandleFunc("/heartbeat", sn.handleHeartbeat)
-
-	// 健康检查
-	mux.HandleFunc("/health", sn.handleHealth)
-
-	log.Printf("种子节点启动，监听: %s", sn.listenAddress)
-	log.Printf("已注册节点数: %d", len(sn.registeredNodes))
-
-	return http.ListenAndServe(sn.listenAddress, mux)
-}
-
-func (sn *SeedNode) handleRegister(w http.ResponseWriter, r *http.Request) {
-	var peer p2p.PeerInfo
-	if err := json.NewDecoder(r.Body).Decode(&peer); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	peer.LastSeen = time.Now()
-	peer.IsActive = true
-
-	sn.mu.Lock()
-	sn.registeredNodes[peer.NodeID] = &peer
-	sn.mu.Unlock()
-
-	log.Printf("注册节点: %s (%s) [总计: %d]", peer.NodeID, peer.Address, len(sn.registeredNodes))
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "registered"})
-}
-
-func (sn *SeedNode) handlePeers(w http.ResponseWriter, r *http.Request) {
-	sn.mu.RLock()
-	defer sn.mu.RUnlock()
-
-	peers := make([]*p2p.PeerInfo, 0, len(sn.registeredNodes))
-	for _, peer := range sn.registeredNodes {
-		// 只返回活跃的节点（5分钟内有心跳）
-		if time.Since(peer.LastSeen) < 5*time.Minute {
-			peers = append(peers, peer)
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(peers)
-
-	log.Printf("节点列表请求: 返回 %d 个活跃节点", len(peers))
-}
-
-func (sn *SeedNode) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	var data map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	nodeID := data["node_id"].(string)
-
-	sn.mu.Lock()
-	if peer, exists := sn.registeredNodes[nodeID]; exists {
-		peer.LastSeen = time.Now()
-	}
-	sn.mu.Unlock()
-
-	w.WriteHeader(http.StatusOK)
-}
-
-func (sn *SeedNode) handleHealth(w http.ResponseWriter, r *http.Request) {
-	sn.mu.RLock()
-	defer sn.mu.RUnlock()
-
-	activeCount := 0
-	for _, peer := range sn.registeredNodes {
-		if time.Since(peer.LastSeen) < 5*time.Minute {
-			activeCount++
-		}
-	}
-
-	health := map[string]interface{}{
-		"status":         "healthy",
-		"total_nodes":    len(sn.registeredNodes),
-		"active_nodes":   activeCount,
-		"uptime_seconds": time.Now().Unix(),
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(health)
-}
+	// 测试配置
+	runTest        = flag.Bool("test", false, "是否运行测试")
+	testRounds     = flag.Int("rounds", 20, "测试轮数")
+	testOutputDir  = flag.String("output", "./test_results", "测试结果输出目录")
+	testMode       = flag.String("mode", "full", "测试模式: full|throughput|latency|decentralization|voting|malicious")
+	maliciousCount = flag.Int("malicious", 0, "恶意节点数量(仅用于malicious模式)")
+)
 
 func main() {
-	port := flag.Int("port", 9000, "监听端口")
 	flag.Parse()
 
-	listenAddress := fmt.Sprintf(":%d", *port)
-	seedNode := NewSeedNode(listenAddress)
+	// 验证必需参数
+	if *nodeID == "" {
+		fmt.Println("错误: 必须指定节点ID (-id)")
+		flag.Usage()
+		os.Exit(1)
+	}
 
-	log.Fatal(seedNode.Start())
+	// 创建日志器
+	logger := utils.NewLogger(*nodeID)
+	logger.Info("========================================")
+	logger.Info("启动 NM-DPoS 节点")
+	logger.Info("节点ID: %s", *nodeID)
+	logger.Info("监听地址: %s", *listenAddr)
+	logger.Info("========================================")
+
+	// 解析种子节点
+	var seeds []string
+	if *seedNodes != "" {
+		seeds = strings.Split(*seedNodes, ",")
+		logger.Info("种子节点: %v", seeds)
+	}
+
+	times, err := time.Parse(time.RFC3339, *initialTime)
+	if err != nil {
+		logger.Warn(err.Error())
+		return
+	}
+
+	// 创建P2P节点
+	p2pNode := node.NewP2PNode(
+		*nodeID,
+		*initialWeight,
+		*performance,
+		*networkDelay,
+		*listenAddr,
+		seeds,
+		times,
+		logger,
+	)
+
+	// 启动节点
+	if err := p2pNode.Start(); err != nil {
+		logger.Error("启动节点失败: %v", err)
+		os.Exit(1)
+	}
+
+	logger.Info("节点启动成功")
+
+	// 如果启用测试模式
+	if *runTest {
+		logger.Info("========================================")
+		logger.Info("启动测试模式")
+		logger.Info("测试持续时间: %d 轮", *testRounds)
+		logger.Info("结果输出目录: %s", *testOutputDir)
+		logger.Info("========================================")
+
+		// 等待网络稳定
+		time.Sleep(20 * time.Second)
+
+		// 等待网络稳定
+		logger.Info("等待网络稳定...")
+		time.Sleep(20 * time.Second)
+
+		// 创建测试器
+		tester := test.NewNetworkTester(p2pNode, logger, *testOutputDir)
+
+		// 根据测试模式运行不同的测试
+		switch *testMode {
+		case "full":
+			// 完整测试
+			tester.RunFullTest(*testRounds)
+
+		case "throughput":
+			// 吞吐量测试
+			duration := time.Duration(*testRounds*config.BlockInterval) * time.Second
+			tester.RunThroughputTest(duration, p2pNode.PeerManager.GetPeerCount()+1)
+
+		case "latency":
+			// 时延测试
+			tester.RunLatencyTest(*testRounds)
+
+		case "decentralization":
+			// 去中心化测试
+			tester.RunDecentralizationTest(*testRounds)
+
+		case "voting":
+			// 投票速率测试
+			tester.RunVotingSpeedTest(*testRounds)
+
+		case "malicious":
+			// 恶意节点测试
+			if *maliciousCount == 0 {
+				logger.Warn("恶意节点测试需要指定 -malicious 参数")
+			} else {
+				tester.RunMaliciousNodeTest(*testRounds, *maliciousCount)
+			}
+
+		default:
+			logger.Error("未知的测试模式: %s", *testMode)
+			logger.Info("支持的模式: full, throughput, latency, decentralization, voting, malicious")
+		}
+	}
+
+	// 等待中断信号
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	logger.Info("节点正在运行，按 Ctrl+C 停止...")
+	<-sigChan
+
+	logger.Info("收到停止信号，正在关闭节点...")
+	p2pNode.Stop()
+	logger.Info("节点已停止")
 }

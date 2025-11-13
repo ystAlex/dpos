@@ -60,6 +60,9 @@ type BlockRecord struct {
 	IsInvalid bool // 是否无效
 	// 无效块从P_j分子中扣除
 
+	ProductionTime   time.Duration // 出块耗时 ← 新增
+	TransactionCount int           // 包含的交易数
+
 	// 验证信息
 	Validators        []string // 参与验证的节点ID列表
 	CorrectValidators []string // 正确验证的节点ID列表

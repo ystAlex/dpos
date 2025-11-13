@@ -19,12 +19,12 @@ import (
 
 // SyncRequest 同步请求数据
 type SyncRequest struct {
-	FromID     string    // 发起请求的节点
-	ToID       string    //请求到的节点
-	FromHeight int       // 请求的起始区块高度
-	ToHeight   int       // 请求的结束区块高度（0表示最新）
-	RequestID  string    // 请求唯一标识
-	Timestamp  time.Time // 请求时间
+	FromID     string    `json:"from_id"`     // 发起请求的节点
+	ToID       string    `json:"to_id"`       //请求到的节点
+	FromHeight int       `json:"from_height"` // 请求的起始区块高度
+	ToHeight   int       `json:"to_height"`   // 请求的结束区块高度（0表示最新）
+	RequestID  string    `json:"request_id"`  // 请求唯一标识
+	Timestamp  time.Time `json:"timestamp"`   // 请求时间
 }
 
 // SyncResponse 同步响应数据
@@ -63,8 +63,8 @@ func NewSyncManager(localNode *types.Node, blockPool *BlockPool, logger *utils.L
 // 同步请求处理（节点A请求数据）
 // ================================
 
-// RequestSync 请求同步区块
-func (sm *SyncManager) RequestSync(nodeID, targetNodeID string, fromHeight, toHeight int, transport *p2p.HTTPTransport, peerManager *p2p.PeerManager) (string, error) {
+// RequestSync 请求同步区块 返回最新同步的区块号
+func (sm *SyncManager) RequestSync(nodeID, targetNodeID string, fromHeight, toHeight int, transport *p2p.HTTPTransport, peerManager *p2p.PeerManager) (int, error) {
 	// 创建同步请求
 	requestID := fmt.Sprintf("sync-%s-%d", nodeID, time.Now().Unix())
 
@@ -77,21 +77,6 @@ func (sm *SyncManager) RequestSync(nodeID, targetNodeID string, fromHeight, toHe
 		Timestamp:  time.Now(),
 	}
 
-	// 序列化请求数据
-	payload, err := json.Marshal(syncReq)
-	if err != nil {
-		return "", fmt.Errorf("序列化同步请求失败: %v", err)
-	}
-
-	peer, exists := peerManager.GetPeer(targetNodeID)
-	if !exists {
-		return "", fmt.Errorf("目标节点 %s 不存在", targetNodeID)
-	}
-
-	if err = transport.SendJSON(peer.Address, "/sync", payload); err != nil {
-		return "", fmt.Errorf("发送同步请求失败: %v", err)
-	}
-
 	// 记录待处理请求
 	sm.mu.Lock()
 	sm.PendingRequests[requestID] = syncReq
@@ -100,7 +85,45 @@ func (sm *SyncManager) RequestSync(nodeID, targetNodeID string, fromHeight, toHe
 	sm.Logger.Info("节点 %s 向 %s 请求同步区块 [%d - %d]",
 		nodeID, targetNodeID, fromHeight, toHeight)
 
-	return requestID, nil
+	// 序列化请求数据
+	//payload, err := json.Marshal(syncReq)
+	//if err != nil {
+	//	return 0, fmt.Errorf("序列化同步请求失败: %v", err)
+	//}
+
+	peer, exists := peerManager.GetPeer(targetNodeID)
+	if !exists {
+		return 0, fmt.Errorf("目标节点 %s 不存在", targetNodeID)
+	}
+
+	payload := map[string]interface{}{
+		"from_id":     syncReq.FromID,
+		"to_id":       syncReq.ToID,
+		"from_height": syncReq.FromHeight,
+		"to_height":   syncReq.ToHeight,
+		"request_id":  syncReq.RequestID,
+		"timestamp":   syncReq.Timestamp,
+	}
+
+	// TODO : 处理response的数据
+	resp, err := transport.SendJSON(peer.Address, "/sync_request", payload)
+
+	if err != nil {
+		return 0, fmt.Errorf("发送同步请求失败: %v", err)
+	}
+
+	var syncResp SyncResponse
+	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
+		sm.Logger.Warn("解析处理同步请求数据失败: %v", err)
+		return 0, fmt.Errorf("解析处理同步请求数据失败: %v", err)
+	}
+
+	syncHeight, err := sm.HandleSyncResponse(syncResp, transport, peerManager)
+	if err != nil {
+		sm.Logger.Warn("处理同步响应失败: %v", err)
+	}
+
+	return syncHeight, nil
 }
 
 // HandleSyncRequest 处理收到的同步请求
@@ -175,8 +198,8 @@ func (sm *SyncManager) getBlocksForSync(req *SyncRequest) ([]*Block, int, bool) 
 // 同步响应处理（节点A接收数据）
 // ================================
 
-// HandleSyncResponse 处理收到的同步响应
-func (sm *SyncManager) HandleSyncResponse(syncResp SyncResponse, transport *p2p.HTTPTransport, peerManager *p2p.PeerManager) error {
+// HandleSyncResponse 处理收到的同步响应 返回的是同步到的最新的区块号
+func (sm *SyncManager) HandleSyncResponse(syncResp SyncResponse, transport *p2p.HTTPTransport, peerManager *p2p.PeerManager) (int, error) {
 	sm.Logger.Info("收到来自 %s 的同步响应，包含 %d 个区块",
 		syncResp.FromID, len(syncResp.Blocks))
 
@@ -187,7 +210,7 @@ func (sm *SyncManager) HandleSyncResponse(syncResp SyncResponse, transport *p2p.
 
 	if !exists {
 		sm.Logger.Warn("收到未知请求ID的同步响应: %s", syncResp.RequestID)
-		return nil
+		return 0, nil
 	}
 
 	// 应用收到的区块
@@ -202,12 +225,14 @@ func (sm *SyncManager) HandleSyncResponse(syncResp SyncResponse, transport *p2p.
 
 	sm.Logger.Info("成功同步 %d/%d 个区块", successCount, len(syncResp.Blocks))
 
+	var syncHeight = 0
+	var err error
 	// 如果还有更多区块，继续请求
 	if syncResp.HasMore {
 		nextFromHeight := req.FromHeight + len(syncResp.Blocks)
 		sm.Logger.Info("继续请求更多区块，起始高度: %d", nextFromHeight)
 
-		_, err := sm.RequestSync(
+		syncHeight, err = sm.RequestSync(
 			syncResp.ToID,
 			syncResp.FromID,
 			nextFromHeight,
@@ -215,6 +240,7 @@ func (sm *SyncManager) HandleSyncResponse(syncResp SyncResponse, transport *p2p.
 			transport,
 			peerManager,
 		)
+
 		if err != nil {
 			sm.Logger.Warn("继续同步失败: %v", err)
 		}
@@ -222,12 +248,16 @@ func (sm *SyncManager) HandleSyncResponse(syncResp SyncResponse, transport *p2p.
 		sm.Logger.Info("区块同步完成，当前高度: %d", syncResp.LatestHeight)
 	}
 
-	// 清理已完成的请求
+	// 清理已完成的请求,无论成功还是失败的
 	sm.mu.Lock()
 	delete(sm.PendingRequests, syncResp.RequestID)
 	sm.mu.Unlock()
 
-	return nil
+	if syncHeight > syncResp.LatestHeight {
+		return syncHeight, nil
+	}
+
+	return syncResp.LatestHeight, nil
 }
 
 // applyBlock 应用区块到本地区块池
@@ -279,32 +309,33 @@ func (sm *SyncManager) validateBlock(block *Block) error {
 // ================================
 
 // CheckAndSync 检查是否需要同步并自动执行
-func (sm *SyncManager) CheckAndSync(nodeID string, peerNodeIDs []string, localHeight int, transport *p2p.HTTPTransport, peerManager *p2p.PeerManager) (bool, error) {
-	// 估算网络最新高度（简化实现，实际应查询多个节点）
-	networkLatestHeight := localHeight + 5 // 假设网络可能领先5个区块
+func (sm *SyncManager) CheckAndSync(nodeID string, peerNodeIDs []string, localHeight int, newestHeight int, transport *p2p.HTTPTransport, peerManager *p2p.PeerManager) (int, error) {
+	networkLatestHeight := newestHeight
 
-	const syncThreshold = 10
-	if networkLatestHeight-localHeight > syncThreshold {
+	if networkLatestHeight-localHeight > 0 {
 		sm.Logger.Info("节点 %s 落后 %d 个区块，触发同步",
 			nodeID, networkLatestHeight-localHeight)
 
 		if len(peerNodeIDs) == 0 {
-			return false, fmt.Errorf("没有可用的对等节点")
+			return 0, fmt.Errorf("没有可用的对等节点")
 		}
 
-		// 选择第一个对等节点
+		//只需要选择第一个对等节点
 		targetPeer := peerNodeIDs[0]
+		if targetPeer == nodeID {
+			targetPeer = peerNodeIDs[1]
+		}
 
 		// 发起同步请求
-		_, err := sm.RequestSync(nodeID, targetPeer, localHeight+1, 0, transport, peerManager)
+		syncHeight, err := sm.RequestSync(nodeID, targetPeer, localHeight+1, 0, transport, peerManager)
 		if err != nil {
-			return false, err
+			return 0, err
 		}
 
-		return true, nil
+		return syncHeight, nil
 	}
 
-	return false, nil
+	return 0, nil
 }
 
 // ================================

@@ -9,7 +9,7 @@ package config
 // ================================
 
 const (
-	// DecayConstant 衰减常数 c
+	// DecayConstant 衰减常数 c 控制权重衰减的基础速度
 	// 公式：λ = c * (1 - R_i)
 	// 推荐值：0.2（经过实验验证）
 	DecayConstant = 0.2
@@ -89,7 +89,7 @@ const (
 	// 扣除保证金比例（30%）
 	BlockFailurePenalty = 0.3
 
-	// BlockReward 出块奖励
+	// BlockReward 固定出块奖励
 	BlockReward = 100.0
 
 	// TransactionFeeRatio 交易手续费分配比例
@@ -101,9 +101,9 @@ const (
 // ================================
 
 const (
-	// NumDelegates 代理节点数量
-	// 典型值：11, 21, 51
-	NumDelegates = 11
+	// NumDelegates 代理节点数量，确保小于总节点数
+	// 典型值：2，11, 21, 51
+	NumDelegates = 3
 
 	// BlockInterval 出块间隔（秒）
 	BlockInterval = 3
@@ -118,6 +118,9 @@ const (
 
 	// MaxPeers 最大对等节点数
 	MaxPeers = 100
+
+	// MaxBlocksPerSync 每次同步最多获取的区块数
+	MaxBlocksPerSync = 100
 )
 
 // ================================

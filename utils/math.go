@@ -71,7 +71,7 @@ func SigmoidFunction(x, tau float64) float64 {
 }
 
 // VotingBehaviorScore 计算历史投票行为评分
-// 公式：B_i = 1 / (1 + ln(γ/(γ+β)))
+// 公式：B_i = 1 / (1 + ln((γ+β)/γ))
 // 参数：
 //   - successfulVotes: 成功投票次数 γ
 //   - failedVotes: 失败投票次数 β

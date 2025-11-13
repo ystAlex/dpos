@@ -139,16 +139,18 @@ type Block struct {
 
 // BlockPool 区块池
 type BlockPool struct {
-	mu     sync.RWMutex
-	blocks map[int]*Block // height -> block
-	latest *Block
-	index  map[string]*Block // hash -> block
+	mu           sync.RWMutex
+	blocks       map[int]*Block // height -> block
+	latest       *Block
+	newestNumber int               // 最新的区块号
+	index        map[string]*Block // hash -> block
 }
 
 // NewBlockPool 创建区块池
 func NewBlockPool() *BlockPool {
 	return &BlockPool{
 		blocks: make(map[int]*Block),
+		index:  make(map[string]*Block),
 	}
 }
 
@@ -179,6 +181,11 @@ func (bp *BlockPool) AddBlock(block *Block) error {
 		bp.latest = block
 	}
 
+	if block.Height > bp.newestNumber {
+		//更新最新的区块信息
+		bp.newestNumber = block.Height
+	}
+
 	return nil
 }
 
@@ -199,6 +206,16 @@ func (bp *BlockPool) GetLatestBlock() *Block {
 	bp.mu.RLock()
 	defer bp.mu.RUnlock()
 	return bp.latest
+}
+
+// GetNewestBlockNumber 获取最新全网区块号
+func (bp *BlockPool) GetNewestBlockNumber() int {
+	return bp.newestNumber
+}
+
+// SetNewestBlockNumber 更新最新全网区块号
+func (bp *BlockPool) SetNewestBlockNumber(blockNumber int) {
+	bp.newestNumber = blockNumber
 }
 
 // GetBlockByHash 通过哈希获取区块

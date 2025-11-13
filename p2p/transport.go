@@ -26,25 +26,25 @@ func NewHTTPTransport(timeout time.Duration) *HTTPTransport {
 }
 
 // SendJSON 发送JSON数据
-func (t *HTTPTransport) SendJSON(targetAddr, path string, data interface{}) error {
+func (t *HTTPTransport) SendJSON(targetAddr, path string, data interface{}) (*http.Response, error) {
 	url := fmt.Sprintf("http://%s%s", targetAddr, path)
 
 	jsonData, err := json.Marshal(data)
 	if err != nil {
-		return fmt.Errorf("序列化失败: %v", err)
+		return nil, fmt.Errorf("序列化失败: %v", err)
 	}
 
 	resp, err := t.client.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		return fmt.Errorf("发送失败: %v", err)
+		return nil, fmt.Errorf("发送失败: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("请求失败，状态码: %d", resp.StatusCode)
+		return nil, fmt.Errorf("请求失败，状态码: %d", resp.StatusCode)
 	}
 
-	return nil
+	return resp, nil
 }
 
 // GetJSON 获取JSON数据
@@ -74,7 +74,8 @@ func (t *HTTPTransport) BroadcastJSON(peers []*PeerInfo, path string, data inter
 	errorCount := 0
 
 	for _, peer := range peers {
-		if err := t.SendJSON(peer.Address, path, data); err != nil {
+		fmt.Printf("[Transport] 广播新生成区块到节点 %s \n", peer.NodeID)
+		if _, err := t.SendJSON(peer.Address, path, data); err != nil {
 			errorCount++
 		} else {
 			successCount++

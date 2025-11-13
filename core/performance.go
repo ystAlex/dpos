@@ -4,6 +4,7 @@ import (
 	"nm-dpos/config"
 	"nm-dpos/types"
 	"nm-dpos/utils"
+	"time"
 )
 
 // performance.go
@@ -37,6 +38,8 @@ func UpdateVoterPerformance(node *types.Node, votingThreshold, delegatePerforman
 	weights := []float64{config.AlphaWeight, config.BetaWeight, config.GammaWeight}
 
 	performance := utils.WeightedScore(scores, weights)
+
+	//限制在[0,1]范围内
 	node.PerformanceScore = utils.ClampScore(performance)
 
 	return node.PerformanceScore
@@ -97,7 +100,7 @@ func CalculateVotingSpeed(node *types.Node, threshold float64) float64 {
 // ================================
 
 // CalculateVotingBehavior 计算历史投票行为评分
-// 公式：B_i = 1 / (1 + ln(γ_i / (γ_i + β_i)))
+// 公式：B_i = 1 / (1 + ln( (γ_i + β_i)/γ_i ))
 //
 // 参数：
 //   - node: 投票节点
@@ -309,13 +312,15 @@ func RecordVoteFailure(node *types.Node) {
 
 // RecordBlockProduction 记录出块
 // 更新代理节点的出块统计和历史记录
-func RecordBlockProduction(node *types.Node, blockHeight int, success, delayed, invalid bool) {
+func RecordBlockProduction(node *types.Node, blockHeight int, success, delayed, invalid bool, productionTime time.Duration, count int) {
 	record := types.BlockRecord{
-		Timestamp:   node.LastUpdateTime,
-		BlockHeight: blockHeight,
-		Success:     success,
-		IsDelayed:   delayed,
-		IsInvalid:   invalid,
+		Timestamp:        node.LastUpdateTime,
+		BlockHeight:      blockHeight,
+		Success:          success,
+		IsDelayed:        delayed,
+		ProductionTime:   productionTime,
+		IsInvalid:        invalid,
+		TransactionCount: count,
 	}
 
 	node.BlockHistory = append(node.BlockHistory, record)

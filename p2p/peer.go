@@ -43,9 +43,9 @@ func (pm *PeerManager) AddPeer(peer *PeerInfo) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	if peer.NodeID == pm.localNodeID {
-		return nil // 不添加自己
-	}
+	//if peer.NodeID == pm.localNodeID {
+	//	return nil // 不添加自己
+	//}
 
 	pm.peers[peer.NodeID] = peer
 	return nil
